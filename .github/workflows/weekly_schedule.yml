@@ -1,0 +1,27 @@
+name: Weekly Schedule Post
+
+on:
+  schedule:
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install icalendar requests python-dateutil
+
+      - name: Run script
+        env:
+          ICS_URL: https://calendar.google.com/calendar/ical/c_f500258fbc8ff94a21342c8dd6a36c2f89ed084d8056bbc41c33676e4b003529%40group.calendar.google.com/public/basic.ics
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python post_schedule.py
