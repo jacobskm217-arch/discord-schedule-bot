@@ -11,7 +11,6 @@ ICS_URL = os.environ["ICS_URL"]
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
 TZ = ZoneInfo("America/New_York")
 
-DISCORD_LIMIT = 2000
 SAFE_LIMIT = 1850  # leave slack for headers/part labels
 
 # Domains we never want to show in Discord (noise)
@@ -54,7 +53,6 @@ def is_blocked_url(url: str) -> bool:
         if scheme in BLOCKED_SCHEMES:
             return True
 
-        # Exact domain block
         if host in BLOCKED_LINK_DOMAINS:
             return True
 
@@ -171,13 +169,32 @@ def post_to_discord(content: str) -> None:
         raise RuntimeError(f"Discord webhook failed {resp.status_code}: {resp.text[:500]}")
 
 
+def next_weekday_range_mon_fri(now: datetime) -> tuple[datetime, datetime]:
+    """
+    Returns (start, end) for the *next* Monday 00:00 through Saturday 00:00 (i.e., Mon–Fri).
+    Uses local timezone already attached to `now`.
+    """
+    # weekday(): Mon=0 ... Sun=6
+    days_until_monday = (7 - now.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7  # if it's Monday, target next week's Monday
+
+    next_monday = (now + timedelta(days=days_until_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    next_saturday = next_monday + timedelta(days=5)  # Saturday 00:00
+    return next_monday, next_saturday
+
+
 def main():
     ics_text = fetch_ics(ICS_URL)
     cal = Calendar.from_ical(ics_text)
 
     now = datetime.now(TZ)
-    start = now
-    end = now + timedelta(days=7)
+    start, end = next_weekday_range_mon_fri(now)
+
+    # Header includes the date range for clarity
+    header = f"📅 **Next Week (Mon–Fri): {start.strftime('%b %d')}–{(end - timedelta(days=1)).strftime('%b %d')}**"
 
     events = []
     for component in cal.walk("VEVENT"):
@@ -207,7 +224,7 @@ def main():
     events.sort(key=lambda e: e["time"])
 
     if not events:
-        post_to_discord("📅 **Schedule (Next 7 Days)**\n\nNo events found in the next 7 days.")
+        post_to_discord(header + "\n\nNo events found for next Monday–Friday.")
         return
 
     blocks: list[str] = []
@@ -255,7 +272,6 @@ def main():
 
         blocks.append("")
 
-    header = "📅 **Schedule (Next 7 Days)**"
     messages = split_into_messages(blocks, header)
 
     if len(messages) > 1:
