@@ -15,6 +15,7 @@ TZ = ZoneInfo("America/New_York")
 SAFE_LIMIT = 1850  # leave slack for headers/part labels
 STATE_FILE = "schedule_state.json"
 
+# Domains we never want to show in Discord (noise)
 BLOCKED_LINK_DOMAINS = {"tel.meet", "support.google.com"}
 BLOCKED_SCHEMES = {"tel"}
 
@@ -39,6 +40,11 @@ def short_domain(url: str) -> str:
         return "link"
 
 
+def normalize_url(url: str) -> str:
+    # Trim common trailing punctuation that shows up in descriptions
+    return (url or "").strip().rstrip(").,;\"'")
+
+
 def is_blocked_url(url: str) -> bool:
     try:
         p = urlparse(url)
@@ -50,6 +56,10 @@ def is_blocked_url(url: str) -> bool:
 
 
 def extract_links(text: str) -> list[tuple[str, str]]:
+    """
+    Returns list of (label, url) from HTML anchors and naked URLs.
+    De-duped by URL, blocked/noise links filtered out.
+    """
     links: list[tuple[str, str]] = []
     t = html.unescape(text or "")
 
@@ -57,23 +67,28 @@ def extract_links(text: str) -> list[tuple[str, str]]:
         r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
         re.IGNORECASE | re.DOTALL,
     )
+
     for url, label in anchor_pat.findall(t):
-        url = url.strip()
-        if is_blocked_url(url):
+        url = normalize_url(url)
+        if not url or is_blocked_url(url):
             continue
         label = re.sub(r"<[^>]+>", "", label)
-        label = " ".join(label.split()).strip() or short_domain(url)
+        label = " ".join(label.split()).strip()
+        if not label:
+            label = short_domain(url)
         links.append((label, url))
 
+    # Remove anchors before scanning for naked URLs (avoid duplicates)
     t_no_anchors = anchor_pat.sub(" ", t)
 
     url_pat = re.compile(r"(https?://[^\s<>\"]+)")
     for url in url_pat.findall(t_no_anchors):
-        url = url.rstrip(").,;\"'").strip()
-        if is_blocked_url(url):
+        url = normalize_url(url)
+        if not url or is_blocked_url(url):
             continue
         links.append((short_domain(url), url))
 
+    # De-dupe by URL, preserve order
     seen = set()
     deduped: list[tuple[str, str]] = []
     for label, url in links:
@@ -84,16 +99,30 @@ def extract_links(text: str) -> list[tuple[str, str]]:
 
 
 def html_to_text(desc: str) -> str:
+    """
+    Convert HTML-ish ICS descriptions into readable plain text.
+    We keep this URL-free later; links are handled separately.
+    """
     if not desc:
         return ""
+
     t = desc.replace("\\n", "\n").replace("\\,", ",")
     t = html.unescape(t)
+
+    # <br> => newline
     t = re.sub(r"<\s*br\s*/?\s*>", "\n", t, flags=re.IGNORECASE)
+
+    # Remove bold tags
     t = re.sub(r"</?\s*b\s*>", "", t, flags=re.IGNORECASE)
+
+    # Remove anchor tags but keep visible text
     t = re.sub(r'<a\s+[^>]*href="[^"]+"[^>]*>', "", t, flags=re.IGNORECASE)
     t = re.sub(r"</\s*a\s*>", "", t, flags=re.IGNORECASE)
+
+    # Strip any remaining tags
     t = re.sub(r"<[^>]+>", "", t)
 
+    # Clean whitespace / blank runs
     lines = [ln.strip() for ln in t.splitlines()]
     cleaned = []
     for ln in lines:
@@ -118,13 +147,10 @@ def split_into_messages(blocks: list[str], header: str) -> list[str]:
 
 
 def webhook_messages_base(webhook_url: str) -> str:
-    # WEBHOOK_URL looks like: https://discord.com/api/webhooks/{id}/{token}
-    # Message endpoints: .../api/webhooks/{id}/{token}/messages/{message_id}
     return webhook_url.rstrip("/") + "/messages"
 
 
 def post_to_discord_return_id(content: str) -> str:
-    # wait=true makes Discord return the created message JSON (including id)
     url = WEBHOOK_URL.rstrip("/") + "?wait=true"
     resp = requests.post(url, json={"content": content}, timeout=30)
     if resp.status_code >= 300:
@@ -136,7 +162,6 @@ def post_to_discord_return_id(content: str) -> str:
 def delete_discord_message(message_id: str) -> None:
     url = f"{webhook_messages_base(WEBHOOK_URL)}/{message_id}"
     resp = requests.delete(url, timeout=30)
-    # 204 = deleted; 404 = already gone; treat both as fine
     if resp.status_code not in (204, 404):
         raise RuntimeError(f"Discord delete failed {resp.status_code}: {resp.text[:500]}")
 
@@ -170,15 +195,102 @@ def next_weekday_range_mon_fri(now: datetime) -> tuple[datetime, datetime]:
     return next_monday, next_saturday
 
 
+def classify_links(links: list[tuple[str, str]]) -> dict:
+    """
+    Return a structured set:
+      - wsib: (label, url) or None
+      - canvas: (label, url) or None
+      - meet: (label, url) or None
+      - other: list[(label, url)]
+    Heuristics:
+      - Canvas: canvas.usuhs.edu
+      - Meet: meet.google.com
+      - WSIB: Google Docs/Drive sheet/doc/pdf that looks like WSIB in label OR url contains 'docs.google.com' and label contains 'WSIB'
+    """
+    wsib = None
+    canvas = None
+    meet = None
+    other = []
+
+    for label, url in links:
+        host = urlparse(url).netloc.lower().replace("www.", "")
+        label_norm = (label or "").strip()
+
+        # Canvas
+        if host.endswith("canvas.usuhs.edu"):
+            if canvas is None:
+                canvas = (label_norm or "Canvas", url)
+            else:
+                other.append((label_norm or short_domain(url), url))
+            continue
+
+        # Google Meet
+        if host.endswith("meet.google.com"):
+            if meet is None:
+                meet = (label_norm or "Meet", url)
+            else:
+                other.append((label_norm or short_domain(url), url))
+            continue
+
+        # WSIB heuristic (best-effort): a Google Docs link where label mentions WSIB
+        if ("WSIB" in label_norm.upper()) and host.endswith("docs.google.com"):
+            if wsib is None:
+                wsib = (label_norm or "WSIB", url)
+            else:
+                other.append((label_norm or short_domain(url), url))
+            continue
+
+        # Fallback: everything else
+        other.append((label_norm or short_domain(url), url))
+
+    return {"wsib": wsib, "canvas": canvas, "meet": meet, "other": other}
+
+
+def extract_wsib_title_line(desc_text: str) -> str | None:
+    """
+    Pulls a human-friendly WSIB title from lines like:
+      'WSIB | Histology Lab (MDL)'
+    Returns the right side ('Histology Lab (MDL)') if present.
+    """
+    if not desc_text:
+        return None
+    for ln in desc_text.splitlines():
+        ln = ln.strip()
+        if ln.upper().startswith("WSIB"):
+            # Match 'WSIB | something'
+            m = re.match(r"^WSIB\s*\|\s*(.+)$", ln, flags=re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                return val if val else None
+    return None
+
+
+def compact_url_free_description(desc_text: str, max_lines: int = 3) -> str | None:
+    """
+    Compact, URL-free snippet (skips lines containing http/https).
+    """
+    if not desc_text:
+        return None
+
+    desc_lines = []
+    for ln in desc_text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if "http://" in ln or "https://" in ln:
+            continue
+        desc_lines.append(ln)
+
+    if not desc_lines:
+        return None
+
+    compact = desc_lines[:max_lines]
+    if len(desc_lines) > max_lines:
+        compact.append("…")
+    return "\n".join(compact)
+
+
 def main():
-    now = datetime.now(TZ)
-
-    # If you're scheduling this for Sundays at 07:00 ET, this guard prevents accidental duplicates
-    if not (now.weekday() == 6 and now.hour == 7):
-        # Allow manual runs anytime (set MANUAL_RUN=true in workflow if you want)
-        if os.environ.get("MANUAL_RUN", "").lower() != "true":
-            return
-
     # Delete previous week's messages first
     old_ids = load_previous_message_ids()
     for mid in old_ids:
@@ -204,15 +316,22 @@ def main():
             title = str(component.get("SUMMARY", "(No title)")).strip()
             location = str(component.get("LOCATION", "")).strip()
             raw_desc = str(component.get("DESCRIPTION", "") or "")
-            desc_text = html_to_text(raw_desc)
+
+            # Parse and classify links
             links = extract_links(raw_desc)
+            link_buckets = classify_links(links)
+
+            # WSIB display name may exist even when the WSIB file isn't present as a link
+            desc_text = html_to_text(raw_desc)
+            wsib_title = extract_wsib_title_line(desc_text)
 
             events.append({
                 "time": dtstart,
                 "title": title,
                 "location": location,
-                "desc": desc_text,
-                "links": links,
+                "desc_text": desc_text,
+                "wsib_title": wsib_title,
+                "links": link_buckets,
             })
 
     events.sort(key=lambda e: e["time"])
@@ -237,33 +356,52 @@ def main():
         if e["location"]:
             blocks.append(f"📍 {e['location']}")
 
-        # URL-free description snippet
-        if e["desc"]:
-            desc_lines = []
-            for ln in e["desc"].splitlines():
-                ln = ln.strip()
-                if not ln:
-                    continue
-                if "http://" in ln or "https://" in ln:
-                    continue
-                desc_lines.append(ln)
+        # Optional compact snippet (URL-free)
+        snippet = compact_url_free_description(e["desc_text"], max_lines=2)
+        if snippet:
+            # But avoid showing the raw "WSIB | ..." line if we're going to render WSIB as a link
+            snippet_lines = snippet.splitlines()
+            snippet_lines = [ln for ln in snippet_lines if not re.match(r"^WSIB\s*\|", ln, flags=re.IGNORECASE)]
+            snippet = "\n".join(snippet_lines).strip()
+            if snippet:
+                blocks.append(snippet)
 
-            if desc_lines:
-                compact = desc_lines[:3]
-                if len(desc_lines) > 3:
-                    compact.append("…")
-                blocks.append("\n".join(compact))
+        # Deliberate link rendering
+        wsib = e["links"]["wsib"]
+        canvas = e["links"]["canvas"]
+        meet = e["links"]["meet"]
+        other = e["links"]["other"]
 
-        # Links only here
-        if e["links"]:
-            link_lines = []
-            for label, url in e["links"][:4]:
-                label = (label or "").strip()
-                if label and label.lower() not in {short_domain(url).lower(), url.lower()}:
-                    link_lines.append(f"- {label}: {url}")
-                else:
-                    link_lines.append(f"- {url}")
-            blocks.append("🔗 Links:\n" + "\n".join(link_lines))
+        link_lines = []
+
+        if wsib:
+            # If we have a nicer WSIB title from "WSIB | ...", use that as the label but still show raw URL
+            wsib_label = e["wsib_title"] or "WSIB"
+            link_lines.append(f"**WSIB:** {wsib[1]}")
+        elif e["wsib_title"]:
+            # There was a WSIB title but no WSIB link found
+            # Don't fabricate a link; just omit the WSIB line.
+            pass
+
+        if canvas:
+            link_lines.append(f"**Canvas:** {canvas[1]}")
+
+        if meet:
+            link_lines.append(f"**Meet:** {meet[1]}")
+
+        if link_lines:
+            blocks.append("\n".join(link_lines))
+
+        if other:
+            # Filter out duplicates of the primary links
+            primary_urls = set(u for _, u in [wsib, canvas, meet] if _ is not None)
+            other_lines = []
+            for label, url in other:
+                if url in primary_urls:
+                    continue
+                other_lines.append(f"- {label}: {url}" if label else f"- {url}")
+            if other_lines:
+                blocks.append("**Other Links:**\n" + "\n".join(other_lines))
 
         blocks.append("")
 
