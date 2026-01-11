@@ -2,14 +2,20 @@ name: Weekly Schedule Post
 
 on:
   schedule:
-    - cron: "0 22 * * 0"
+    # GitHub Actions cron uses UTC.
+    # 12:00 UTC is ~07:00 Eastern during standard time (and ~08:00 during daylight time).
+    - cron: "0 12 * * 0"
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   post:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,8 +26,18 @@ jobs:
         run: |
           pip install icalendar requests python-dateutil
 
-      - name: Run script
+      - name: Run schedule poster
         env:
-          ICS_URL: https://calendar.google.com/calendar/ical/c_f500258fbc8ff94a21342c8dd6a36c2f89ed084d8056bbc41c33676e4b003529%40group.calendar.google.com/public/basic.ics
+          ICS_URL: https://calendar.google.com/calendar/ical/c_f500258fbc8ff94a21342c8dd6a36c2f89ed084d8056bbc41c33676e4b003529@group.calendar.google.com/public/basic.ics
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # Allows you to manually run anytime without the Sunday 07:00 guard blocking it.
+          MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python post_schedule.py
+
+      - name: Commit schedule state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add schedule_state.json || true
+          git commit -m "Update schedule state" || true
+          git push || true
