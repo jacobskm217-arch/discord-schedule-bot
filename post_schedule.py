@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import html
 import requests
 from icalendar import Calendar
@@ -12,14 +13,9 @@ WEBHOOK_URL = os.environ["DISCORD_WEBHOOK"]
 TZ = ZoneInfo("America/New_York")
 
 SAFE_LIMIT = 1850  # leave slack for headers/part labels
+STATE_FILE = "schedule_state.json"
 
-# Domains we never want to show in Discord (noise)
-BLOCKED_LINK_DOMAINS = {
-    "tel.meet",
-    "support.google.com",
-}
-
-# Also block these URL schemes (if they appear)
+BLOCKED_LINK_DOMAINS = {"tel.meet", "support.google.com"}
 BLOCKED_SCHEMES = {"tel"}
 
 
@@ -30,10 +26,9 @@ def fetch_ics(url: str) -> str:
 
 
 def to_local_datetime(dt):
-    # dt can be date or datetime depending on event type
     if hasattr(dt, "hour"):  # datetime
         return dt.astimezone(TZ) if dt.tzinfo else dt.replace(tzinfo=TZ)
-    return None  # skip all-day events for this summary
+    return None  # skip all-day events
 
 
 def short_domain(url: str) -> str:
@@ -49,49 +44,29 @@ def is_blocked_url(url: str) -> bool:
         p = urlparse(url)
         scheme = (p.scheme or "").lower()
         host = (p.netloc or "").lower().replace("www.", "")
-
-        if scheme in BLOCKED_SCHEMES:
-            return True
-
-        if host in BLOCKED_LINK_DOMAINS:
-            return True
-
-        return False
+        return scheme in BLOCKED_SCHEMES or host in BLOCKED_LINK_DOMAINS
     except Exception:
         return False
 
 
 def extract_links(text: str) -> list[tuple[str, str]]:
-    """
-    Returns list of (label, url).
-    - If HTML anchors exist, uses anchor text as label.
-    - Also captures naked URLs.
-    - Filters out blocked/noise links (tel.meet, support.google.com, tel:)
-    """
     links: list[tuple[str, str]] = []
-
     t = html.unescape(text or "")
 
-    # Extract HTML anchors: <a href="URL">TEXT</a>
     anchor_pat = re.compile(
         r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL
+        re.IGNORECASE | re.DOTALL,
     )
     for url, label in anchor_pat.findall(t):
         url = url.strip()
         if is_blocked_url(url):
             continue
-
-        label = re.sub(r"<[^>]+>", "", label)  # strip nested tags
-        label = " ".join(label.split()).strip()
-        if not label:
-            label = short_domain(url)
+        label = re.sub(r"<[^>]+>", "", label)
+        label = " ".join(label.split()).strip() or short_domain(url)
         links.append((label, url))
 
-    # Remove anchors so we don’t duplicate when scanning naked URLs
     t_no_anchors = anchor_pat.sub(" ", t)
 
-    # Naked URLs
     url_pat = re.compile(r"(https?://[^\s<>\"]+)")
     for url in url_pat.findall(t_no_anchors):
         url = url.rstrip(").,;\"'").strip()
@@ -99,7 +74,6 @@ def extract_links(text: str) -> list[tuple[str, str]]:
             continue
         links.append((short_domain(url), url))
 
-    # De-dupe by URL, preserve order
     seen = set()
     deduped: list[tuple[str, str]] = []
     for label, url in links:
@@ -110,33 +84,16 @@ def extract_links(text: str) -> list[tuple[str, str]]:
 
 
 def html_to_text(desc: str) -> str:
-    """
-    Convert common HTML-ish ICS descriptions into readable plain text.
-    - <br> => newline
-    - strip remaining tags
-    - unescape entities
-    - collapse excessive blank lines
-    """
     if not desc:
         return ""
-
     t = desc.replace("\\n", "\n").replace("\\,", ",")
     t = html.unescape(t)
-
-    # Normalize <br> to newline
     t = re.sub(r"<\s*br\s*/?\s*>", "\n", t, flags=re.IGNORECASE)
-
-    # Remove bold tags
     t = re.sub(r"</?\s*b\s*>", "", t, flags=re.IGNORECASE)
-
-    # Remove anchor tags but keep visible text (links are listed separately)
     t = re.sub(r'<a\s+[^>]*href="[^"]+"[^>]*>', "", t, flags=re.IGNORECASE)
     t = re.sub(r"</\s*a\s*>", "", t, flags=re.IGNORECASE)
-
-    # Strip any remaining tags
     t = re.sub(r"<[^>]+>", "", t)
 
-    # Clean whitespace
     lines = [ln.strip() for ln in t.splitlines()]
     cleaned = []
     for ln in lines:
@@ -147,9 +104,6 @@ def html_to_text(desc: str) -> str:
 
 
 def split_into_messages(blocks: list[str], header: str) -> list[str]:
-    """
-    Packs blocks into multiple Discord messages under SAFE_LIMIT.
-    """
     messages = []
     current = header.strip() + "\n\n"
     for b in blocks:
@@ -163,37 +117,77 @@ def split_into_messages(blocks: list[str], header: str) -> list[str]:
     return messages
 
 
-def post_to_discord(content: str) -> None:
-    resp = requests.post(WEBHOOK_URL, json={"content": content}, timeout=30)
+def webhook_messages_base(webhook_url: str) -> str:
+    # WEBHOOK_URL looks like: https://discord.com/api/webhooks/{id}/{token}
+    # Message endpoints: .../api/webhooks/{id}/{token}/messages/{message_id}
+    return webhook_url.rstrip("/") + "/messages"
+
+
+def post_to_discord_return_id(content: str) -> str:
+    # wait=true makes Discord return the created message JSON (including id)
+    url = WEBHOOK_URL.rstrip("/") + "?wait=true"
+    resp = requests.post(url, json={"content": content}, timeout=30)
     if resp.status_code >= 300:
-        raise RuntimeError(f"Discord webhook failed {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"Discord post failed {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    return str(data["id"])
+
+
+def delete_discord_message(message_id: str) -> None:
+    url = f"{webhook_messages_base(WEBHOOK_URL)}/{message_id}"
+    resp = requests.delete(url, timeout=30)
+    # 204 = deleted; 404 = already gone; treat both as fine
+    if resp.status_code not in (204, 404):
+        raise RuntimeError(f"Discord delete failed {resp.status_code}: {resp.text[:500]}")
+
+
+def load_previous_message_ids() -> list[str]:
+    if not os.path.exists(STATE_FILE):
+        return []
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ids = data.get("message_ids", [])
+        return [str(x) for x in ids if str(x).strip()]
+    except Exception:
+        return []
+
+
+def save_message_ids(ids: list[str]) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"message_ids": ids}, f, indent=2)
 
 
 def next_weekday_range_mon_fri(now: datetime) -> tuple[datetime, datetime]:
-    """
-    Returns (start, end) for the *next* Monday 00:00 through Saturday 00:00 (i.e., Mon–Fri).
-    Uses local timezone already attached to `now`.
-    """
-    # weekday(): Mon=0 ... Sun=6
+    # Next Monday 00:00 → Saturday 00:00 (Mon–Fri)
     days_until_monday = (7 - now.weekday()) % 7
     if days_until_monday == 0:
-        days_until_monday = 7  # if it's Monday, target next week's Monday
-
+        days_until_monday = 7
     next_monday = (now + timedelta(days=days_until_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    next_saturday = next_monday + timedelta(days=5)  # Saturday 00:00
+    next_saturday = next_monday + timedelta(days=5)
     return next_monday, next_saturday
 
 
 def main():
+    now = datetime.now(TZ)
+
+    # If you're scheduling this for Sundays at 07:00 ET, this guard prevents accidental duplicates
+    if not (now.weekday() == 6 and now.hour == 7):
+        # Allow manual runs anytime (set MANUAL_RUN=true in workflow if you want)
+        if os.environ.get("MANUAL_RUN", "").lower() != "true":
+            return
+
+    # Delete previous week's messages first
+    old_ids = load_previous_message_ids()
+    for mid in old_ids:
+        delete_discord_message(mid)
+
     ics_text = fetch_ics(ICS_URL)
     cal = Calendar.from_ical(ics_text)
 
-    now = datetime.now(TZ)
-    start, end = next_weekday_range_mon_fri(now)
-
-    # Header includes the date range for clarity
+    start, end = next_weekday_range_mon_fri(datetime.now(TZ))
     header = f"📅 **Next Week (Mon–Fri): {start.strftime('%b %d')}–{(end - timedelta(days=1)).strftime('%b %d')}**"
 
     events = []
@@ -204,7 +198,7 @@ def main():
 
         dtstart = to_local_datetime(dtstart_raw.dt)
         if dtstart is None:
-            continue  # skip all-day events
+            continue
 
         if start <= dtstart < end:
             title = str(component.get("SUMMARY", "(No title)")).strip()
@@ -224,7 +218,8 @@ def main():
     events.sort(key=lambda e: e["time"])
 
     if not events:
-        post_to_discord(header + "\n\nNo events found for next Monday–Friday.")
+        new_id = post_to_discord_return_id(header + "\n\nNo events found for next Monday–Friday.")
+        save_message_ids([new_id])
         return
 
     blocks: list[str] = []
@@ -242,7 +237,7 @@ def main():
         if e["location"]:
             blocks.append(f"📍 {e['location']}")
 
-        # Description: URL-free, compact (first ~3 non-empty lines)
+        # URL-free description snippet
         if e["desc"]:
             desc_lines = []
             for ln in e["desc"].splitlines():
@@ -259,7 +254,7 @@ def main():
                     compact.append("…")
                 blocks.append("\n".join(compact))
 
-        # Links: all URLs go here, filtered, always raw URLs
+        # Links only here
         if e["links"]:
             link_lines = []
             for label, url in e["links"][:4]:
@@ -281,8 +276,12 @@ def main():
             for i, msg in enumerate(messages)
         ]
 
+    new_ids = []
     for msg in messages:
-        post_to_discord(msg)
+        mid = post_to_discord_return_id(msg)
+        new_ids.append(mid)
+
+    save_message_ids(new_ids)
 
 
 if __name__ == "__main__":
