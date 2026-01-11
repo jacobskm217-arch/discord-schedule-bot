@@ -27,6 +27,7 @@ def fetch_ics(url: str) -> str:
 
 
 def to_local_datetime(dt):
+    """Convert an icalendar dt (date or datetime) into localized datetime, or None for all-day."""
     if hasattr(dt, "hour"):  # datetime
         return dt.astimezone(TZ) if dt.tzinfo else dt.replace(tzinfo=TZ)
     return None  # skip all-day events
@@ -63,7 +64,6 @@ def is_blocked_url(url: str) -> bool:
 
 def is_google_doc_like(url: str) -> bool:
     host = url_host(url)
-    # WSIB links you’re seeing are usually Google Sheets
     return host.endswith("docs.google.com") or host.endswith("drive.google.com")
 
 
@@ -109,9 +109,7 @@ def extract_links(text: str) -> list[tuple[str, str]]:
 
 
 def html_to_text(desc: str) -> str:
-    """
-    Convert HTML-ish ICS descriptions into readable plain text.
-    """
+    """Convert HTML-ish ICS descriptions into readable plain text."""
     if not desc:
         return ""
     t = desc.replace("\\n", "\n").replace("\\,", ",")
@@ -202,25 +200,31 @@ def next_weekday_range_mon_fri(now: datetime) -> tuple[datetime, datetime]:
     return next_monday, next_saturday
 
 
+# WSIB marker lines can be "WSIB | ..." or "WSIB: ..."
+WSIB_MARKER_RE = re.compile(r"^WSIB\s*[\|\:]\s*(.+)$", flags=re.IGNORECASE)
+
+
 def extract_wsib_title(desc_text: str) -> str | None:
-    """
-    Pulls the right side from lines like:
-      'WSIB | MILMED 100: LAB Cardiac/PTX Ultrasound'
-    """
+    """Extract WSIB title from either 'WSIB | ...' or 'WSIB: ...'."""
     if not desc_text:
         return None
     for ln in desc_text.splitlines():
         ln = ln.strip()
-        m = re.match(r"^WSIB\s*\|\s*(.+)$", ln, flags=re.IGNORECASE)
+        m = WSIB_MARKER_RE.match(ln)
         if m:
             val = m.group(1).strip()
             return val if val else None
     return None
 
 
+def is_wsib_marker_line(line: str) -> bool:
+    """True for any WSIB marker line we never want to show in descriptions."""
+    return bool(WSIB_MARKER_RE.match((line or "").strip()))
+
+
 def make_compact_description(desc_text: str, max_lines: int = 2) -> str | None:
     """
-    URL-free snippet, and NEVER include WSIB| lines.
+    URL-free snippet, and NEVER include WSIB marker lines (pipe or colon forms).
     """
     if not desc_text:
         return None
@@ -232,8 +236,7 @@ def make_compact_description(desc_text: str, max_lines: int = 2) -> str | None:
             continue
         if "http://" in ln or "https://" in ln:
             continue
-        # Remove any WSIB marker line
-        if re.match(r"^WSIB\s*\|", ln, flags=re.IGNORECASE):
+        if is_wsib_marker_line(ln):
             continue
         keep.append(ln)
 
@@ -253,14 +256,14 @@ def classify_links(links: list[tuple[str, str]], wsib_title_present: bool) -> di
       - canvas: url or None
       - meet: url or None
       - other: list[(label,url)]
+
     WSIB rule:
       If wsib_title_present and there is at least one Google doc-like link,
       treat the first such link as WSIB (even if label doesn't say WSIB).
     """
     canvas_url = None
     meet_url = None
-
-    google_doc_links = []  # candidates for WSIB
+    google_doc_links = []
     other = []
 
     for label, url in links:
@@ -288,14 +291,11 @@ def classify_links(links: list[tuple[str, str]], wsib_title_present: bool) -> di
 
     wsib_url = None
 
-    # If WSIB title exists, "upgrade" the first Google doc link to WSIB
     if wsib_title_present and google_doc_links:
         wsib_url = google_doc_links[0][1]
-        # Any remaining google doc links become "Other Links"
         for label, url in google_doc_links[1:]:
             other.append((label, url))
     else:
-        # No WSIB title; treat google doc links as other
         for label, url in google_doc_links:
             other.append((label, url))
 
@@ -307,12 +307,55 @@ def classify_links(links: list[tuple[str, str]], wsib_title_present: bool) -> di
     }
 
 
+def get_event_end(component, dtstart_local: datetime) -> datetime | None:
+    """
+    Determine event end time as localized datetime.
+    Supports DTEND or DURATION.
+    """
+    dtend_raw = component.get("DTEND")
+    if dtend_raw is not None:
+        dtend_local = to_local_datetime(dtend_raw.dt)
+        return dtend_local
+
+    duration = component.get("DURATION")
+    if duration is not None:
+        try:
+            return dtstart_local + duration.dt
+        except Exception:
+            return None
+
+    return None
+
+
+def format_time_range(dtstart_local: datetime, dtend_local: datetime | None) -> str:
+    """
+    Format as:
+      'Thu Jan 15, 08:00–12:00' (same day)
+      'Thu Jan 15, 08:00–Fri Jan 16, 09:00' (spans days)
+      or just 'Thu Jan 15, 08:00' if no end.
+    """
+    start_str = dtstart_local.strftime("%a %b %d, %H:%M")
+    if dtend_local is None:
+        return start_str
+
+    # Some calendars encode end equal to start; ignore if nonsense
+    if dtend_local <= dtstart_local:
+        return start_str
+
+    if dtend_local.date() == dtstart_local.date():
+        end_str = dtend_local.strftime("%H:%M")
+        return f"{start_str}–{end_str}"
+
+    end_str = dtend_local.strftime("%a %b %d, %H:%M")
+    return f"{start_str}–{end_str}"
+
+
 def format_event_block(event: dict) -> str:
     """
     Title first line, then labeled fields.
     """
     title = event["title"]
-    time_str = event["time"].strftime("%a %b %d, %H:%M")
+    time_str = event["time_str"]
     location = event["location"]
     desc = event.get("desc_snippet")
 
@@ -330,7 +373,6 @@ def format_event_block(event: dict) -> str:
     if desc:
         lines.append(desc)
 
-    # Primary labeled links
     if wsib_url:
         lines.append(f"WSIB: {wsib_url}")
     if canvas_url:
@@ -338,7 +380,6 @@ def format_event_block(event: dict) -> str:
     if meet_url:
         lines.append(f"Meet: {meet_url}")
 
-    # Other Links
     if other_links:
         lines.append("Other Links:")
         for label, url in other_links:
@@ -368,28 +409,32 @@ def main():
         if not dtstart_raw:
             continue
 
-        dtstart = to_local_datetime(dtstart_raw.dt)
-        if dtstart is None:
+        dtstart_local = to_local_datetime(dtstart_raw.dt)
+        if dtstart_local is None:
             continue  # skip all-day
 
-        if start <= dtstart < end:
+        if start <= dtstart_local < end:
             title = str(component.get("SUMMARY", "(No title)")).strip()
             location = str(component.get("LOCATION", "")).strip()
             raw_desc = str(component.get("DESCRIPTION", "") or "")
 
+            dtend_local = get_event_end(component, dtstart_local)
+            time_str = format_time_range(dtstart_local, dtend_local)
+
             desc_text = html_to_text(raw_desc)
-            wsib_title = extract_wsib_title(desc_text)
+            wsib_title = extract_wsib_title(desc_text)  # handles WSIB | and WSIB:
             desc_snippet = make_compact_description(desc_text, max_lines=2)
 
             links_raw = extract_links(raw_desc)
             buckets = classify_links(links_raw, wsib_title_present=bool(wsib_title))
 
-            # Remove any "Other Links" that duplicate primary links
+            # Remove duplicates of primary links from other links
             primary_urls = {u for u in [buckets["wsib"], buckets["canvas"], buckets["meet"]] if u}
             buckets["other"] = [(lbl, url) for (lbl, url) in buckets["other"] if url not in primary_urls]
 
             events.append({
-                "time": dtstart,
+                "time": dtstart_local,
+                "time_str": time_str,
                 "title": title,
                 "location": location,
                 "desc_snippet": desc_snippet,
@@ -403,7 +448,6 @@ def main():
         save_message_ids([new_id])
         return
 
-    # Build blocks grouped by day label (optional, but keeps it readable)
     blocks: list[str] = []
     current_day = None
 
@@ -414,7 +458,7 @@ def main():
             blocks.append(f"__**{day_label}**__")
 
         blocks.append(format_event_block(e))
-        blocks.append("")  # spacer
+        blocks.append("")
 
     messages = split_into_messages(blocks, header)
 
