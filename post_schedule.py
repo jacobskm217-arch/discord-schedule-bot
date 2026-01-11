@@ -28,6 +28,14 @@ def to_local_datetime(dt):
     return None  # skip all-day events for this summary
 
 
+def short_domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc
+        return host.replace("www.", "") or "link"
+    except Exception:
+        return "link"
+
+
 def extract_links(text: str) -> list[tuple[str, str]]:
     """
     Returns list of (label, url).
@@ -36,11 +44,13 @@ def extract_links(text: str) -> list[tuple[str, str]]:
     """
     links: list[tuple[str, str]] = []
 
-    # Unescape HTML entities first so regex sees normal characters
     t = html.unescape(text or "")
 
     # Extract HTML anchors: <a href="URL">TEXT</a>
-    anchor_pat = re.compile(r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    anchor_pat = re.compile(
+        r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL
+    )
     for url, label in anchor_pat.findall(t):
         label = re.sub(r"<[^>]+>", "", label)  # strip nested tags
         label = " ".join(label.split()).strip()
@@ -54,26 +64,17 @@ def extract_links(text: str) -> list[tuple[str, str]]:
     # Naked URLs
     url_pat = re.compile(r"(https?://[^\s<>\"]+)")
     for url in url_pat.findall(t_no_anchors):
-        # trim trailing punctuation
         url = url.rstrip(").,;\"'")
         links.append((short_domain(url), url))
 
     # De-dupe by URL, preserve order
     seen = set()
-    deduped = []
+    deduped: list[tuple[str, str]] = []
     for label, url in links:
         if url not in seen:
             deduped.append((label, url))
             seen.add(url)
     return deduped
-
-
-def short_domain(url: str) -> str:
-    try:
-        host = urlparse(url).netloc
-        return host.replace("www.", "") or "link"
-    except Exception:
-        return "link"
 
 
 def html_to_text(desc: str) -> str:
@@ -93,10 +94,10 @@ def html_to_text(desc: str) -> str:
     # Normalize <br> to newline
     t = re.sub(r"<\s*br\s*/?\s*>", "\n", t, flags=re.IGNORECASE)
 
-    # Turn bold tags into nothing (Discord formatting handled separately)
+    # Remove bold tags
     t = re.sub(r"</?\s*b\s*>", "", t, flags=re.IGNORECASE)
 
-    # Remove anchor tags but keep their visible text (we list links separately)
+    # Remove anchor tags but keep visible text (links are listed separately)
     t = re.sub(r'<a\s+[^>]*href="[^"]+"[^>]*>', "", t, flags=re.IGNORECASE)
     t = re.sub(r"</\s*a\s*>", "", t, flags=re.IGNORECASE)
 
@@ -105,15 +106,12 @@ def html_to_text(desc: str) -> str:
 
     # Clean whitespace
     lines = [ln.strip() for ln in t.splitlines()]
-    # Drop empty runs
     cleaned = []
     for ln in lines:
         if ln == "" and (not cleaned or cleaned[-1] == ""):
             continue
         cleaned.append(ln)
-    t = "\n".join(cleaned).strip()
-
-    return t
+    return "\n".join(cleaned).strip()
 
 
 def split_into_messages(blocks: list[str], header: str) -> list[str]:
@@ -135,7 +133,6 @@ def split_into_messages(blocks: list[str], header: str) -> list[str]:
 
 def post_to_discord(content: str) -> None:
     resp = requests.post(WEBHOOK_URL, json={"content": content}, timeout=30)
-    # If something goes wrong, fail loudly in Actions logs
     if resp.status_code >= 300:
         raise RuntimeError(f"Discord webhook failed {resp.status_code}: {resp.text[:500]}")
 
@@ -180,7 +177,7 @@ def main():
         return
 
     # Build readable blocks grouped by day
-    blocks = []
+    blocks: list[str] = []
     current_day = None
 
     for e in events:
@@ -190,28 +187,37 @@ def main():
             blocks.append(f"__**{day_label}**__")
 
         time_str = e["time"].strftime("%H:%M")
-        title_line = f"**{time_str} — {e['title']}**"
-        blocks.append(title_line)
+        blocks.append(f"**{time_str} — {e['title']}**")
 
         if e["location"]:
             blocks.append(f"📍 {e['location']}")
 
-        # Keep description compact: first ~3 lines max
+        # Description: URL-free, compact (first ~3 non-empty lines)
         if e["desc"]:
-            desc_lines = [ln for ln in e["desc"].splitlines() if ln.strip()]
+            desc_lines = []
+            for ln in e["desc"].splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                if "http://" in ln or "https://" in ln:
+                    continue
+                desc_lines.append(ln)
+
             if desc_lines:
                 compact = desc_lines[:3]
                 if len(desc_lines) > 3:
                     compact.append("…")
                 blocks.append("\n".join(compact))
 
+        # Links: all URLs go here, always as raw URLs for clickability
         if e["links"]:
-            # Show up to 4 links to keep messages tight
             link_lines = []
             for label, url in e["links"][:4]:
-                # Discord markdown link: [label](url)
-                # (Works well in most clients; if you ever see issues, switch to "label: url")
-                link_lines.append(f"- [{label}]({url})")
+                label = (label or "").strip()
+                if label and label.lower() not in {short_domain(url).lower(), url.lower()}:
+                    link_lines.append(f"- {label}: {url}")
+                else:
+                    link_lines.append(f"- {url}")
             blocks.append("🔗 Links:\n" + "\n".join(link_lines))
 
         blocks.append("")  # spacer between events
