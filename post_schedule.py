@@ -14,6 +14,15 @@ TZ = ZoneInfo("America/New_York")
 DISCORD_LIMIT = 2000
 SAFE_LIMIT = 1850  # leave slack for headers/part labels
 
+# Domains we never want to show in Discord (noise)
+BLOCKED_LINK_DOMAINS = {
+    "tel.meet",
+    "support.google.com",
+}
+
+# Also block these URL schemes (if they appear)
+BLOCKED_SCHEMES = {"tel"}
+
 
 def fetch_ics(url: str) -> str:
     r = requests.get(url, timeout=30)
@@ -36,11 +45,30 @@ def short_domain(url: str) -> str:
         return "link"
 
 
+def is_blocked_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        scheme = (p.scheme or "").lower()
+        host = (p.netloc or "").lower().replace("www.", "")
+
+        if scheme in BLOCKED_SCHEMES:
+            return True
+
+        # Exact domain block
+        if host in BLOCKED_LINK_DOMAINS:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
 def extract_links(text: str) -> list[tuple[str, str]]:
     """
     Returns list of (label, url).
     - If HTML anchors exist, uses anchor text as label.
     - Also captures naked URLs.
+    - Filters out blocked/noise links (tel.meet, support.google.com, tel:)
     """
     links: list[tuple[str, str]] = []
 
@@ -52,6 +80,10 @@ def extract_links(text: str) -> list[tuple[str, str]]:
         re.IGNORECASE | re.DOTALL
     )
     for url, label in anchor_pat.findall(t):
+        url = url.strip()
+        if is_blocked_url(url):
+            continue
+
         label = re.sub(r"<[^>]+>", "", label)  # strip nested tags
         label = " ".join(label.split()).strip()
         if not label:
@@ -64,7 +96,9 @@ def extract_links(text: str) -> list[tuple[str, str]]:
     # Naked URLs
     url_pat = re.compile(r"(https?://[^\s<>\"]+)")
     for url in url_pat.findall(t_no_anchors):
-        url = url.rstrip(").,;\"'")
+        url = url.rstrip(").,;\"'").strip()
+        if is_blocked_url(url):
+            continue
         links.append((short_domain(url), url))
 
     # De-dupe by URL, preserve order
@@ -176,7 +210,6 @@ def main():
         post_to_discord("📅 **Schedule (Next 7 Days)**\n\nNo events found in the next 7 days.")
         return
 
-    # Build readable blocks grouped by day
     blocks: list[str] = []
     current_day = None
 
@@ -209,7 +242,7 @@ def main():
                     compact.append("…")
                 blocks.append("\n".join(compact))
 
-        # Links: all URLs go here, always as raw URLs for clickability
+        # Links: all URLs go here, filtered, always raw URLs
         if e["links"]:
             link_lines = []
             for label, url in e["links"][:4]:
@@ -220,12 +253,11 @@ def main():
                     link_lines.append(f"- {url}")
             blocks.append("🔗 Links:\n" + "\n".join(link_lines))
 
-        blocks.append("")  # spacer between events
+        blocks.append("")
 
     header = "📅 **Schedule (Next 7 Days)**"
     messages = split_into_messages(blocks, header)
 
-    # Add part labels if multiple messages
     if len(messages) > 1:
         total = len(messages)
         messages = [
