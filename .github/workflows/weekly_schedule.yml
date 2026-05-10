@@ -28,7 +28,7 @@ jobs:
 
       - name: Run schedule poster
         env:
-          ICS_URL: https://calendar.google.com/calendar/ical/c_7a08af9fc3e232fdd91bd2af61177d9f18010e594de0c4f805e87dc24cb41143%40group.calendar.google.com/public/basic.ics
+          ICS_URL: https://calendar.google.com/calendar/ical/c_76662ae8fb3d65bdaf0ddb050de7bbb89dee8a216beaf31750369d73f068cf71%40group.calendar.google.com/public/basic.ics
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           # Allows you to manually run anytime without the Sunday 07:00 guard blocking it.
           MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
